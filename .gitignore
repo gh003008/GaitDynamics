@@ -26,3 +26,9 @@ runs/
 example_usage/Geometry
 figures/exports/*
 example_usage/data_unused/*
+
+# Local big artifacts (do not commit)
+combined_data.h5
+combined_data_split/
+previews/
+lab_preprocessed/

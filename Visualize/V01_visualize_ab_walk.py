@@ -14,7 +14,17 @@ REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, '..'))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import nimblephysics as nimble  # noqa: E402
+try:
+    import nimblephysics as nimble  # noqa: E402
+except Exception as e:
+    print('\n[오류] nimblephysics 모듈을 찾을 수 없습니다.\n' \
+          ' - 이 스크립트는 AddBiomechanics의 .b3d 파일을 읽기 위해 nimblephysics가 필요합니다.\n' \
+          ' - conda 또는 별도의 환경에서 Python 3.10/3.11로 nimblephysics를 설치해 주세요.\n' \
+          ' - 설치 가이드: https://github.com/keenon/nimblephysics (또는 배포된 wheel/conda 채널 이용)\n' \
+          f' - 내부 예외: {e}\n')
+    import sys
+    sys.exit(2)
+
 from data.osim_fk import get_model_offsets, forward_kinematics  # noqa: E402
 
 

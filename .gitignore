@@ -32,3 +32,11 @@ combined_data.h5
 combined_data_split/
 previews/
 lab_preprocessed/
+# Ignore large local datasets and generated folders
+data/Wang2023_Formatted_No_Arm/
+gdp_*/
+plots/
+logs_lora_train*
+lora_train.pid
+h5viewer/
+lab_preprocessing/

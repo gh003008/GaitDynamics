@@ -74,7 +74,7 @@ def build_lines(ax, joint_names):
     return edges, lines
 
 
-def animate_skeleton(joints_xyz, joint_names, out_path, fps=60):
+def animate_skeleton(joints_xyz, joint_names, out_path, fps=60, view_init=(15, -80)):
     """Animate joints over time and save as MP4 (fallback GIF). joints_xyz: [T, J, 3]."""
     T, J, _ = joints_xyz.shape
 
@@ -92,7 +92,8 @@ def animate_skeleton(joints_xyz, joint_names, out_path, fps=60):
     ax.set_xlim(cx - span / 2, cx + span / 2)
     ax.set_ylim(cy - span / 2, cy + span / 2)
     ax.set_zlim(cz - span / 2, cz + span / 2)
-    ax.view_init(elev=15, azim=-80)
+    # Camera view
+    ax.view_init(elev=view_init[0], azim=view_init[1])
 
     edges, lines = build_lines(ax, joint_names)
 
@@ -139,14 +140,21 @@ def animate_skeleton(joints_xyz, joint_names, out_path, fps=60):
     return saved_path
 
 
+def animate_sagittal(joints_xyz, joint_names, out_path, fps=60, sagittal_azim=-90, elev=15):
+    """Create a sagittal-view 3D animation (side view) and save as MP4 (or GIF fallback)."""
+    return animate_skeleton(joints_xyz, joint_names, out_path, fps=fps, view_init=(elev, sagittal_azim))
+
+
 def main():
     ap = argparse.ArgumentParser(description='Visualize AB walk trial as a simple lower-body skeleton animation (no arms).')
     ap.add_argument('--b3d', type=str, default=os.path.join(REPO_ROOT, 'data', 'Wang2023_Formatted_No_Arm', 'Wang2023_Formatted_No_Arm', 'Subj06', 'Subj06.b3d'), help='Path to a SubjectOnDisk .b3d file')
     ap.add_argument('--trial_substr', type=str, default='walk', help='Substring to match a walk trial name')
     ap.add_argument('--out_dir', type=str, default=os.path.join(REPO_ROOT, 'previews'), help='Output directory for video/image')
     ap.add_argument('--start', type=int, default=0, help='Start frame index (inclusive)')
-    ap.add_argument('--frames', type=int, default=250, help='Number of frames to render (<= trial length)')
+    ap.add_argument('--frames', type=int, default=None, help='Number of frames to render (overrides duration if set)')
+    ap.add_argument('--duration_sec', type=float, default=10.0, help='Target clip duration in seconds (used if --frames not set)')
     ap.add_argument('--fps', type=int, default=60, help='Output video FPS')
+    ap.add_argument('--sagittal_azim', type=float, default=-90.0, help='Azimuth for sagittal view (side) animation')
     args = ap.parse_args()
 
     if not os.path.exists(args.b3d):
@@ -164,9 +172,13 @@ def main():
     poses, fs = read_trial_states(subject, trial_id)  # poses [T, D]
     T_total, D = poses.shape
 
-    # Restrict to a window
+    # Decide frame count: prefer --frames, else compute from duration_sec and trial fps
     start = max(0, min(args.start, T_total - 1))
-    end = min(T_total, start + args.frames)
+    if args.frames is not None and args.frames > 0:
+        n_frames = int(args.frames)
+    else:
+        n_frames = int(max(1, round(args.duration_sec * fs)))
+    end = min(T_total, start + n_frames)
     poses = poses[start:end]
 
     # Take the first 23 OSIM DOFs (pelvis + lower body + lumbar)
@@ -209,14 +221,57 @@ def main():
     # Save animation
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     subj = os.path.splitext(os.path.basename(args.b3d))[0]
-    base = f"ab_walk_{subj}_{trial_name}_{timestamp}"
-    base = base.replace('/', '_')
-    out_base = os.path.join(args.out_dir, base)
-    saved_path = animate_skeleton(joint_xyz_np, joint_names, out_base, fps=args.fps)
+    run_name = f"ab_walk_{subj}_{trial_name}_{timestamp}".replace('/', '_')
+    out_dir = os.path.join(args.out_dir, run_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Save main 3D animation (default view)
+    out_base_main = os.path.join(out_dir, 'main')
+    main_path = animate_skeleton(joint_xyz_np, joint_names, out_base_main, fps=args.fps)
+
+    # Save sagittal-view animation (side view GIF/MP4)
+    out_base_sag = os.path.join(out_dir, 'sagittal')
+    sag_path = animate_sagittal(joint_xyz_np, joint_names, out_base_sag, fps=args.fps, sagittal_azim=args.sagittal_azim)
+
+    # Also save a first-frame PNG snapshot for quick preview
+    try:
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        P0 = joint_xyz_np[0]
+        edges = []
+        name_to_idx = {n: i for i, n in enumerate(joint_names)}
+        def e(a, b):
+            if a in name_to_idx and b in name_to_idx:
+                edges.append((name_to_idx[a], name_to_idx[b]))
+        e('pelvis','hip_r'); e('hip_r','knee_r'); e('knee_r','ankle_r'); e('ankle_r','calcn_r'); e('calcn_r','mtp_r')
+        e('pelvis','hip_l'); e('hip_l','knee_l'); e('knee_l','ankle_l'); e('ankle_l','calcn_l'); e('calcn_l','mtp_l')
+        for (i, j) in edges:
+            ax.plot([P0[i,0], P0[j,0]], [P0[i,1], P0[j,1]], [P0[i,2], P0[j,2]], lw=2)
+        # Fit view
+        all_xyz = joint_xyz_np.reshape(-1, 3)
+        xmin, ymin, zmin = np.min(all_xyz, axis=0)
+        xmax, ymax, zmax = np.max(all_xyz, axis=0)
+        cx, cy, cz = (xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2
+        span = max(xmax - xmin, ymax - ymin, zmax - zmin)
+        span = max(span, 0.5)
+        ax.set_xlim(cx - span / 2, cx + span / 2)
+        ax.set_ylim(cy - span / 2, cy + span / 2)
+        ax.set_zlim(cz - span / 2, cz + span / 2)
+        ax.view_init(elev=15, azim=-80)
+        png_path = os.path.join(out_dir, 'first_frame.png')
+        fig.savefig(png_path, dpi=200)
+        plt.close(fig)
+    except Exception:
+        png_path = None
 
     print('[ok] Visualized:', trial_name)
     print('  frames:', joint_xyz_np.shape[0], '(subset of', T_total, ')')
-    print('  output:', saved_path)
+    print('  outputs:')
+    print('   - main:', main_path)
+    print('   - sagittal:', sag_path)
+    if png_path:
+        print('   - snapshot:', png_path)
 
 
 if __name__ == '__main__':

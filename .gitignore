@@ -36,7 +36,6 @@ lab_preprocessed/
 data/Wang2023_Formatted_No_Arm/
 gdp_*/
 plots/
-lora/
 logs_lora_train*
 lora_train.pid
 h5viewer/

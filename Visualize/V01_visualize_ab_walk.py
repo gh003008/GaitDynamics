@@ -181,12 +181,30 @@ def main():
 
     # Forward kinematics to get joint points
     foot_xyz, joint_xyz, joint_names, _ = forward_kinematics(poses23, offsets, with_arm=False)
-    # joint_xyz shape: [J, T, 3] on torch device; bring to CPU numpy [T, J, 3]
+    # joint_xyz shape is [J, B, T, 3] (B=1). Convert to [T, J, 3] on CPU numpy.
+    if hasattr(joint_xyz, 'detach'):
+        j = joint_xyz.detach().cpu()
+    else:
+        j = np.asarray(joint_xyz)
+    # Torch path
     try:
-        joint_xyz_np = joint_xyz.detach().cpu().numpy().transpose(1, 0, 2)
+        if hasattr(j, 'numpy'):
+            j_np = j.numpy()
+        else:
+            j_np = np.asarray(j)
     except Exception:
-        # In case it's already numpy
-        joint_xyz_np = np.asarray(joint_xyz).transpose(1, 0, 2)
+        j_np = np.asarray(j)
+    # Squeeze batch dim if present: [J, 1, T, 3] -> [J, T, 3]
+    while j_np.ndim == 4 and j_np.shape[1] == 1:
+        j_np = j_np[:, 0]
+    # Now expect [J, T, 3]; transpose to [T, J, 3]
+    if j_np.ndim == 3 and j_np.shape[-1] == 3 and j_np.shape[0] < j_np.shape[1]:
+        joint_xyz_np = j_np.transpose(1, 0, 2)
+    elif j_np.ndim == 3 and j_np.shape[-1] == 3 and j_np.shape[0] > j_np.shape[1]:
+        # Already [T, J, 3]
+        joint_xyz_np = j_np
+    else:
+        raise RuntimeError(f"예상치 못한 joint_xyz shape: {j_np.shape}")
 
     # Save animation
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

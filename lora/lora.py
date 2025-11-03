@@ -135,7 +135,32 @@ def load_lora_weights(model: nn.Module, ckpt_path: str):
     Load a saved LoRA adapter state dict into a model that has already been injected with LoRA.
     """
     import torch
-    ckpt = torch.load(ckpt_path, map_location='cpu')
+    from torch.serialization import add_safe_globals
+
+    # Robust load for PyTorch 2.6+ where weights_only=True is default
+    def _try_load(weights_only: bool):
+        return torch.load(ckpt_path, map_location='cpu', weights_only=weights_only)
+
+    try:
+        ckpt = _try_load(weights_only=True)
+    except Exception:
+        # Allowlist custom classes that may appear in trainer checkpoints
+        try:
+            from data.scaler import MinMaxScaler
+            add_safe_globals([MinMaxScaler])
+        except Exception:
+            pass
+        try:
+            # Some checkpoints may reference Normalizer via __main__ or data.preprocess
+            from data.preprocess import Normalizer
+            add_safe_globals([Normalizer])
+        except Exception:
+            pass
+
+        # Fallback to potentially unsafe load if file is trusted
+        ckpt = _try_load(weights_only=False)
+
+    # Some trainers save {'lora_state_dict': ...}, others save the raw state_dict
     state = ckpt.get('lora_state_dict', ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     return missing, unexpected

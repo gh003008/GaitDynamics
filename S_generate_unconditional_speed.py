@@ -23,19 +23,39 @@ from typing import List
 import numpy as np
 import torch
 import pandas as pd
+from types import SimpleNamespace
 
 # Project root
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from args import parse_opt
-from consts import OSIM_DOF_ALL
+from consts import OSIM_DOF_ALL, JOINTS_3D_ALL, KINETICS_ALL, MODEL_STATES_COLUMN_NAMES_NO_ARM
 from model.model import MotionModel
 from model.utils import inverse_convert_addb_state_to_model_input
 
 
 def build_opt(window_len: int = 150, target_hz: int = 100):
-    opt = parse_opt()
+    # Minimal opt object mimicking training-time column config (no CLI parsing)
+    opt = SimpleNamespace()
+    opt.with_arm = False
+    opt.with_kinematics_vel = True
+
+    # Columns: OSIM 23 DoFs + kinetics
+    opt.osim_dof_columns = list(OSIM_DOF_ALL[:23] + KINETICS_ALL)
+    # Joints with 3 DoF used during training
+    opt.joints_3d = {k: v for k, v in JOINTS_3D_ALL.items() if k in ['pelvis', 'hip_r', 'hip_l', 'lumbar']}
+    # Base model-state columns
+    opt.model_states_column_names = list(MODEL_STATES_COLUMN_NAMES_NO_ARM)
+    # Add 3D joint angular velocities (x,y,z) per training
+    for joint_name, joints_with_3_dof in opt.joints_3d.items():
+        opt.model_states_column_names += [f"{joint_name}_{axis}_angular_vel" for axis in ['x', 'y', 'z']]
+    # Add kinematics velocities for non-force columns, excluding pelvis_* and existing *_vel and 6v indices
+    if opt.with_kinematics_vel:
+        opt.model_states_column_names += [
+            f"{col}_vel" for col in opt.model_states_column_names
+            if not any(term in col for term in ['force', 'pelvis_', '_vel', '_0', '_1', '_2', '_3', '_4', '_5'])
+        ]
+
     # Core inference options
     opt.window_len = int(window_len)
     opt.target_sampling_rate = int(target_hz)
@@ -140,9 +160,9 @@ def generate_one(opt, motion_model: MotionModel, speed_mps: float, height_m: flo
         constraint=constraint,
     )  # returns de-normalized MODEL-STATE space (T x C)
 
-    # Convert to OSIM 23-DoF space for export
+    # Convert to OSIM 23-DoF space for export (keep batch dim)
     # motion_model.normalizer.unnormalize already applied within generate_samples
-    model_states = samples_norm.squeeze(0)  # (T, C)
+    model_states = samples_norm  # (1, T, C)
     osim_dofs = inverse_convert_addb_state_to_model_input(
         model_states,
         opt.model_states_column_names,

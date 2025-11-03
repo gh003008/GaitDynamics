@@ -50,9 +50,35 @@ class MotionModel:
 
         checkpoint = None
         if opt.checkpoint != "":
-            checkpoint = torch.load(
-                opt.checkpoint, map_location=self.accelerator.device
-            )
+            # Robust load for PyTorch 2.6+ (weights_only default) while keeping compatibility
+            try:
+                checkpoint = torch.load(
+                    opt.checkpoint, map_location=self.accelerator.device
+                )
+            except Exception:
+                # Retry with explicit weights_only=False and allowlist Normalizer
+                try:
+                    from data.preprocess import Normalizer  # noqa: F401
+                    try:
+                        from torch.serialization import add_safe_globals
+                        add_safe_globals([Normalizer])
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                # Also, some checkpoints reference __main__.Normalizer; alias it to our Normalizer
+                try:
+                    import sys as _sys
+                    from data.preprocess import Normalizer as _GDNorm
+                    from data.scaler import MinMaxScaler as _GDMMS
+                    _sys.modules.setdefault('__main__', __import__('__main__'))
+                    setattr(_sys.modules['__main__'], 'Normalizer', _GDNorm)
+                    setattr(_sys.modules['__main__'], 'MinMaxScaler', _GDMMS)
+                except Exception:
+                    pass
+                checkpoint = torch.load(
+                    opt.checkpoint, map_location=self.accelerator.device, weights_only=False
+                )
             self.normalizer = checkpoint["normalizer"]
 
         # Not tested but a bigger model might be better

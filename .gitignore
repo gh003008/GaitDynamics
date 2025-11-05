@@ -32,6 +32,15 @@ combined_data.h5
 combined_data_split/
 previews/
 lab_preprocessed/
+# Ensure these are always ignored for this branch
+data/
+plots/
+previews/
+gdp_*/
+runs/
+wandb/
+*.npz
+*.h5
 # Ignore large local datasets and generated folders
 data/Wang2023_Formatted_No_Arm/
 gdp_*/

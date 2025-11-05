@@ -4,6 +4,7 @@ import sys
 import json
 import math
 import glob
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Dict
@@ -25,6 +26,22 @@ from model.utils import maybe_wrap
 from data.preprocess import Normalizer
 from data.scaler import MinMaxScaler
 from importlib.machinery import SourceFileLoader
+
+# Optional: Weights & Biases
+_WANDB_AVAILABLE = False
+try:
+    import wandb  # type: ignore
+    _WANDB_AVAILABLE = True
+except Exception:
+    _WANDB_AVAILABLE = False
+
+# Optional: tqdm progress bar
+_TQDM_AVAILABLE = False
+try:
+    from tqdm import tqdm  # type: ignore
+    _TQDM_AVAILABLE = True
+except Exception:
+    _TQDM_AVAILABLE = False
 lora_mod = SourceFileLoader("lora_mod", os.path.join(REPO_ROOT, "lora", "lora.py")).load_module()
 inject_lora = lora_mod.inject_lora
 lora_parameters = lora_mod.lora_parameters
@@ -63,6 +80,10 @@ class CrouchNPZDataset(Dataset):
 
         # Discover files
         self.files = sorted(glob.glob(os.path.join(root, "**", "*.npz"), recursive=True))
+        # If root contains multiple conditions, restrict to the requested keyword (default: 'crouch')
+        if dset_keyword:
+            kw = f"{os.sep}{dset_keyword}{os.sep}"
+            self.files = [f for f in self.files if kw in f]
         if not self.files:
             raise FileNotFoundError(f"No NPZ files found under {root}")
 
@@ -224,6 +245,15 @@ def main():
     epochs = int(os.environ.get('LORA_EPOCHS', '5'))
     batch_size = int(os.environ.get('LORA_BATCH', str(max(1, opt.batch_size // 2))))
     lr = float(os.environ.get('LORA_LR', '1e-3'))
+    weight_decay = float(os.environ.get('LORA_WD', '0.0'))
+    grad_clip = float(os.environ.get('LORA_CLIP', '1.0'))
+    num_workers = int(os.environ.get('LORA_WORKERS', '0'))
+    log_every = int(os.environ.get('LORA_LOG_EVERY', '50'))
+    use_wandb = os.environ.get('WANDB_ENABLE', '0') == '1' and _WANDB_AVAILABLE
+    wandb_project = os.environ.get('WANDB_PROJECT', 'GaitDynamics-LoRA')
+    wandb_entity = os.environ.get('WANDB_ENTITY', None)
+    wandb_name = os.environ.get('WANDB_NAME', exp_name)
+    only_simple_loss = os.environ.get('LORA_ONLY_SIMPLE_LOSS', '1') == '1'
 
     assert opt.checkpoint != "", "Please pass --checkpoint to use the pretrained base model."
 
@@ -269,6 +299,31 @@ def main():
         # Monkey-patch the symbol used in model.model
         model_mod.forward_kinematics = _safe_fk
 
+    # Optionally force a "simple loss only" training step to minimize numerical issues during warmup
+    # This replaces GaussianDiffusion.p_losses at runtime to compute only the reconstruction loss (with p2 weighting)
+    if only_simple_loss:
+        def _simple_p_losses(self, x, cond, t):
+            x_start, model_offsets, _, _, height_m, _ = x
+            noise = torch.randn_like(x_start)
+            x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+            x_recon = self.model(x_noisy, cond, t)
+            model_out = x_recon
+            target = x_start if not self.predict_epsilon else noise
+            loss_simple = self.loss_fn(model_out, target, reduction="none")
+            # p2 weighting without external helper
+            try:
+                b = x_start.shape[0]
+                weight = self.p2_loss_weight[t].view(b, 1, 1)
+                loss_simple = loss_simple * weight
+            except Exception:
+                pass
+            ls = loss_simple.mean()
+            zeros = torch.tensor(0., device=ls.device)
+            return ls, [ls, zeros, zeros, zeros, zeros, loss_simple]
+        # Bind the method to the diffusion instance
+        import types as _types
+        diffusion.p_losses = _types.MethodType(_simple_p_losses, diffusion)
+
     # Load pretrained weights + normalizer
     # Torch >=2.6 defaults weights_only=True; we need full pickle for embedded Normalizer
     try:
@@ -280,8 +335,98 @@ def main():
     normalizer = ckpt.get("normalizer", None)
     if normalizer is None:
         raise RuntimeError("Checkpoint missing embedded normalizer; required for consistent scaling.")
+    # Ensure normalizer/scaler tensors live on CPU to avoid CUDA init in DataLoader workers
+    def _force_normalizer_cpu(norm: Normalizer):
+        try:
+            scaler = norm.scaler
+            for name in [
+                'scale_', 'min_', 'data_min_', 'data_max_', 'data_range_', 'data_mean_'
+            ]:
+                if hasattr(scaler, name):
+                    t = getattr(scaler, name)
+                    if isinstance(t, torch.Tensor):
+                        setattr(scaler, name, t.detach().cpu())
+        except Exception:
+            pass
+        return norm
+    normalizer = _force_normalizer_cpu(normalizer)
     diffusion.model.load_state_dict(maybe_wrap(ckpt["ema_state_dict"], 1))
     diffusion.set_normalizer(normalizer)
+
+    # W&B init (optional) BEFORE dataset creation to allow sweep overrides
+    use_wandb = use_wandb and _WANDB_AVAILABLE
+    run = None
+    if use_wandb:
+        base_config = {
+            "checkpoint": opt.checkpoint,
+            "data_root": data_root,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "grad_clip": grad_clip,
+            "num_workers": num_workers,
+            "window_len": int(opt.window_len),
+            "target_sampling_rate": int(opt.target_sampling_rate),
+            "pseudo_dataset_len": int(opt.pseudo_dataset_len),
+            "only_simple_loss": bool(only_simple_loss),
+        }
+        run = wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_name, config=base_config)
+        cfg = wandb.config
+        # Allow sweep to override some hparams and dataset params
+        def _ov(key, cur, cast=lambda x: x):
+            try:
+                if key in cfg:
+                    return cast(cfg[key])
+            except Exception:
+                pass
+            return cur
+        data_root = _ov('data_root', data_root, str)
+        lora_r = _ov('lora_r', lora_r, int)
+        lora_alpha = _ov('lora_alpha', lora_alpha, int)
+        lora_dropout = _ov('lora_dropout', lora_dropout, float)
+        epochs = _ov('epochs', epochs, int)
+        batch_size = _ov('batch_size', batch_size, int)
+        lr = _ov('lr', lr, float)
+        weight_decay = _ov('weight_decay', weight_decay, float)
+        grad_clip = _ov('grad_clip', grad_clip, float)
+        log_every = _ov('log_every', log_every, int)
+        only_simple_loss = _ov('only_simple_loss', only_simple_loss, bool)
+        # Override model options if provided
+        new_win = _ov('window_len', int(opt.window_len), int)
+        if new_win != int(opt.window_len):
+            opt.window_len = int(new_win)
+        new_sr = _ov('target_sampling_rate', int(opt.target_sampling_rate), int)
+        if new_sr != int(opt.target_sampling_rate):
+            opt.target_sampling_rate = int(new_sr)
+        new_pseudo = _ov('pseudo_dataset_len', int(opt.pseudo_dataset_len), int)
+        if new_pseudo != int(opt.pseudo_dataset_len):
+            opt.pseudo_dataset_len = int(new_pseudo)
+
+        # If the sweep toggled only_simple_loss after diffusion creation, rebind
+        if only_simple_loss:
+            def _simple_p_losses(self, x, cond, t):
+                x_start, model_offsets, _, _, height_m, _ = x
+                noise = torch.randn_like(x_start)
+                x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+                x_recon = self.model(x_noisy, cond, t)
+                model_out = x_recon
+                target = x_start if not self.predict_epsilon else noise
+                loss_simple = self.loss_fn(model_out, target, reduction="none")
+                try:
+                    b = x_start.shape[0]
+                    weight = self.p2_loss_weight[t].view(b, 1, 1)
+                    loss_simple = loss_simple * weight
+                except Exception:
+                    pass
+                ls = loss_simple.mean()
+                zeros = torch.tensor(0., device=ls.device)
+                return ls, [ls, zeros, zeros, zeros, zeros, loss_simple]
+            import types as _types
+            diffusion.p_losses = _types.MethodType(_simple_p_losses, diffusion)
 
     # Inject LoRA and freeze base weights
     replaced, _ = inject_lora(diffusion.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, include_mha_out_proj=True)
@@ -296,7 +441,9 @@ def main():
 
     # Dataset & loader
     dataset = CrouchNPZDataset(root=data_root, opt=opt, window_len=opt.window_len, normalizer=normalizer)
-    num_workers = int(os.environ.get('LORA_WORKERS', '0'))
+    trial_names, dset_names = dataset.get_attributes_of_trials()
+    total_trials = len(dataset.trials)
+    total_windows = dataset.total_windows
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -305,9 +452,31 @@ def main():
         num_workers=num_workers,
         pin_memory=(device.type == 'cuda')
     )
+    # If drop_last would zero out all batches, relax it
+    try:
+        if len(loader) == 0:
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=False,
+                num_workers=num_workers,
+                pin_memory=(device.type == 'cuda')
+            )
+    except Exception:
+        pass
 
     # Optimizer
-    optimizer = torch.optim.AdamW(lora_parameters(diffusion.model), lr=lr)
+    optimizer = torch.optim.AdamW(lora_parameters(diffusion.model), lr=lr, weight_decay=weight_decay)
+    if use_wandb:
+        # Log dataset summary table (truncated)
+        try:
+            table = wandb.Table(columns=["idx","trial","dset"])
+            for i, (n, d) in enumerate(zip(trial_names[:50], dset_names[:50])):
+                table.add_data(i, n, d)
+            wandb.log({"dataset_preview": table})
+        except Exception:
+            pass
 
     # Save dir
     save_dir = Path(save_root) / f"{exp_name}_{torch.randint(0, 10**8, (1,)).item()}"
@@ -323,17 +492,51 @@ def main():
             "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
+            "weight_decay": weight_decay,
+            "grad_clip": grad_clip,
+            "num_workers": num_workers,
             "save_dir": str(save_dir),
-            "wandb": False,
-            "wandb_project": "GaitDynamics-LoRA",
-            "wandb_name": exp_name,
+            "wandb": bool(use_wandb),
+            "wandb_project": wandb_project,
+            "wandb_name": wandb_name,
+            "dataset_trials": int(total_trials),
+            "dataset_total_windows": int(total_windows),
+            "pseudo_dataset_len": int(opt.pseudo_dataset_len),
+            "only_simple_loss": bool(only_simple_loss),
         }, f, indent=2)
 
     diffusion.train()
+    global_step = 0
     for epoch in range(1, epochs + 1):
         running = 0.0
         n = 0
-        for batch in loader:
+        t0 = time.time()
+
+        iterator = loader
+        use_bar = _TQDM_AVAILABLE and (os.environ.get('LORA_TQDM', '1') == '1')
+        if use_bar:
+            try:
+                total_batches = len(loader)
+            except Exception:
+                total_batches = None
+            desc = f"Epoch {epoch}/{epochs}"
+            iterator = tqdm(loader, total=total_batches, desc=desc, dynamic_ncols=True, leave=False)
+
+        # Log loader/dataset sizes at epoch start
+        if use_wandb and epoch == 1:
+            try:
+                wandb.log({
+                    "dataset/num_trials": total_trials,
+                    "dataset/total_windows": total_windows,
+                    "dataset/pseudo_len": int(opt.pseudo_dataset_len),
+                    "loader/num_batches_drop_last": len(loader),
+                    "train/batch_size": int(batch_size),
+                }, step=global_step)
+            except Exception:
+                pass
+
+        nan_skipped = 0
+        for batch in iterator:
             x_start, model_offsets, i_trial, slice_index, height_m, cond = batch
             # Move tensors
             x_start = x_start.to(device)
@@ -345,21 +548,88 @@ def main():
             total_loss, losses = diffusion((x_start, model_offsets, i_trial, slice_index, height_m, cond), cond, t_override=None)
             # Skip NaN batches safely
             if torch.isnan(total_loss):
+                nan_skipped += 1
                 continue
             optimizer.zero_grad()
             total_loss.backward()
+            # Grad clip (LoRA params only)
+            if grad_clip and grad_clip > 0:
+                try:
+                    torch.nn.utils.clip_grad_norm_(list(lora_parameters(diffusion.model)), max_norm=grad_clip)
+                except Exception:
+                    pass
             optimizer.step()
-            running += float(total_loss.detach().cpu().item())
+            step_loss = float(total_loss.detach().cpu().item())
+            running += step_loss
             n += 1
 
+            # Update progress bar postfix
+            if _TQDM_AVAILABLE and use_bar:
+                try:
+                    iterator.set_postfix({
+                        'loss': f"{step_loss:.4f}",
+                        'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
+                    })
+                except Exception:
+                    pass
+
+            # Per-step logging (throttled)
+            if use_wandb and (global_step % log_every == 0):
+                log = {"train/step_loss": step_loss,
+                       "train/epoch": epoch,
+                       "optim/lr": float(optimizer.param_groups[0]['lr'])}
+                # Log loss components if available
+                if isinstance(losses, dict):
+                    for k, v in losses.items():
+                        try:
+                            log[f"loss/{k}"] = float(v.detach().cpu().item())
+                        except Exception:
+                            pass
+                # Grad norm (LoRA only)
+                try:
+                    g2 = 0.0
+                    for p in lora_parameters(diffusion.model):
+                        if p.grad is not None:
+                            g2 += float(p.grad.detach().data.norm(2).item() ** 2)
+                    log["optim/grad_norm"] = math.sqrt(g2)
+                except Exception:
+                    pass
+                # GPU memory
+                if device.type == 'cuda':
+                    try:
+                        log["sys/max_mem_mb"] = torch.cuda.max_memory_allocated(device) / (1024*1024)
+                        log["sys/mem_mb"] = torch.cuda.memory_allocated(device) / (1024*1024)
+                    except Exception:
+                        pass
+                wandb.log(log, step=global_step)
+            global_step += 1
+
         avg = running / max(1, n)
-        print(f"Epoch {epoch}/{epochs} - loss: {avg:.6f}")
+        dt = time.time() - t0
+        print(f"Epoch {epoch}/{epochs} - loss: {avg:.6f} ({n} steps, {dt:.1f}s)")
+        if n == 0:
+            print(f"[WARN] No training steps this epoch. pseudo_len={opt.pseudo_dataset_len}, batch_size={batch_size}, loader_len={len(loader) if hasattr(loader,'__len__') else 'NA'}, nan_skipped={nan_skipped}")
+        if use_wandb:
+            wandb.log({
+                "train/epoch_loss": avg,
+                "train/epoch_time_s": dt,
+                "train/steps": n,
+                "train/nan_skipped": int(nan_skipped),
+                "epoch": epoch
+            }, step=global_step)
 
         # Save every epoch
         save_lora_adapter(diffusion.model, str(save_dir / 'weights' / f'epoch-{epoch}-lora.pt'),
                           extra={"normalizer": normalizer})
+        if use_wandb:
+            try:
+                wandb.save(str(save_dir / 'weights' / f'epoch-{epoch}-lora.pt'), base_path=str(save_dir))
+            except Exception:
+                pass
 
     print(f"[DONE] Saved LoRA adapters under: {save_dir}")
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':

@@ -1,9 +1,0 @@
-{
-  "speeds_mps": [
-    1.2
-  ],
-  "height_m": 1.75,
-  "cycles": 3,
-  "used_lora": false,
-  "lora_ckpt": ""
-}

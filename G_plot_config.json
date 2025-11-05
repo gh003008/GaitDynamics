@@ -1,7 +1,0 @@
-{
-  "ab_base": "./gdp_ab/Wang2023_Formatted_No_Arm",
-  "ld_base": "./gdp_out",
-  "default_t0": 10.0,
-  "default_t1": 20.0,
-  "default_side": "both"
-}

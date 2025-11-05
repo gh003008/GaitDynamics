@@ -1,0 +1,22 @@
+name: gaitdyn2
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.16
+  - numpy=1.23.5
+  - scipy
+  - matplotlib
+  - h5py
+  - pyyaml
+  - tqdm
+  - pip
+  - cudatoolkit=11.6
+  - pytorch=1.13.1
+  - pip:
+    - einops
+    - tensorboard
+    - typing_extensions
+    - opencv-python
+    - scikit-learn

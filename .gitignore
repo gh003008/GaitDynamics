@@ -49,3 +49,7 @@ logs_lora_train*
 lora_train.pid
 h5viewer/
 lab_preprocessing/
+
+# Local dataset exclusions requested by user (ensure large local folders aren't pushed)
+data/AB/
+data/LD/

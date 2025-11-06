@@ -210,7 +210,11 @@ def train_ld(opt):
     
     # Create model
     print("Creating model...")
-    model = MotionModel(opt)
+    model = MotionModel(
+        opt,
+        learning_rate=opt.learning_rate,
+        weight_decay=opt.weight_decay
+    )
     
     # Initialize wandb if enabled (with error handling for metadata issues)
     if opt.log_with_wandb:
@@ -225,8 +229,44 @@ def train_ld(opt):
                 config=vars(opt),
                 settings=wandb.Settings(_disable_meta=True)  # Disable metadata collection
             )
+            
+            # Log hyperparameters explicitly for sweep tracking
+            wandb.config.update({
+                'learning_rate': opt.learning_rate,
+                'weight_decay': opt.weight_decay,
+                'batch_size': opt.batch_size,
+                'pseudo_dataset_len': opt.pseudo_dataset_len,
+                'epochs': opt.epochs,
+                'window_len': opt.window_len,
+                'num_params': sum(p.numel() for p in model.diffusion.parameters()),
+                'num_train_trials': len(train_dataset.trials),
+            }, allow_val_change=True)
+            
+            # Log initial data statistics for reference
+            sample_data = train_dataset.trials[0].converted_pose  # Normalized data
+            wandb.log({
+                'data_stats/normalized_mean': sample_data.mean().item(),
+                'data_stats/normalized_std': sample_data.std().item(),
+                'data_stats/normalized_min': sample_data.min().item(),
+                'data_stats/normalized_max': sample_data.max().item(),
+            })
+            
+            # Log channel-wise statistics for key joints
+            for i, col_name in enumerate(opt.model_states_column_names):
+                if any(key in col_name for key in ['knee_angle', 'hip_flexion', 'ankle_angle', 'ground_force']):
+                    col_data = sample_data[:, i]
+                    wandb.log({
+                        f'data_stats/{col_name}_mean': col_data.mean().item(),
+                        f'data_stats/{col_name}_std': col_data.std().item(),
+                    })
+            
             wandb.watch(model.diffusion, F.mse_loss, log='all', log_freq=200)
             print("✓ Wandb initialized successfully")
+            print(f"  - Learning Rate: {opt.learning_rate}")
+            print(f"  - Batch Size: {opt.batch_size}")
+            print(f"  - Pseudo Dataset Length: {opt.pseudo_dataset_len}")
+            print(f"  - Epochs: {opt.epochs}")
+            print(f"  - Model Parameters: {sum(p.numel() for p in model.diffusion.parameters()):,}")
         except Exception as e:
             print(f"⚠ Warning: wandb initialization failed: {e}")
             print("Continuing without wandb logging...")

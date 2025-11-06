@@ -1,0 +1,24 @@
+program: train_models_only_LD.py
+method: grid
+metric:
+  name: test/loss
+  goal: minimize
+
+parameters:
+  # Fixed parameters
+  log_with_wandb:
+    value: true
+  
+  batch_size:
+    value: 80
+  
+  # Grid search: 2 LR × 3 epochs = 6 configs
+  learning_rate:
+    values: [1e-4, 4e-4]
+  
+  epochs:
+    values: [300, 500, 1000]
+  
+  # Larger pseudo dataset for more data diversity
+  pseudo_dataset_len:
+    value: 20000

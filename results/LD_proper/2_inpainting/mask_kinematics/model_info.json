@@ -1,0 +1,18 @@
+{
+  "checkpoint_path": "runs\\train\\LD_proper\\weights\\train-100_diffusion.pt",
+  "mask_type": "mask_kinematics",
+  "num_masked_channels": 9,
+  "masked_channels": [
+    "pelvis_tx",
+    "pelvis_ty",
+    "pelvis_tz",
+    "knee_angle_r",
+    "ankle_angle_r",
+    "subtalar_angle_r",
+    "knee_angle_l",
+    "ankle_angle_l",
+    "subtalar_angle_l"
+  ],
+  "test_trials": 11,
+  "model_params": 5822527
+}

@@ -1,0 +1,19 @@
+{
+  "num_trials": 1,
+  "mask_type": "mask_kinematics",
+  "num_masked_channels": 9,
+  "avg_mse": 0.9877307415008545,
+  "avg_mae": 0.5867003798484802,
+  "avg_rmse": 0.9938464164733887,
+  "avg_correlation": 0.31290460705265766,
+  "per_trial": [
+    {
+      "trial": "S011_accel_sine_trial_01",
+      "mse": 0.9877307415008545,
+      "mae": 0.5867003798484802,
+      "rmse": 0.9938464164733887,
+      "correlation": 0.31290460705265766,
+      "num_masked_channels": 9
+    }
+  ]
+}

@@ -184,6 +184,11 @@ class MotionModel:
 
             joint_loss = np.zeros([opt.model_states_column_names.__len__()])
             dataset_loss_record = np.zeros([len(train_dataset.trials)])
+            
+            # Track training health metrics
+            batch_losses = []
+            grad_norms = []
+            param_changes = []
 
             self.train()
 
@@ -193,6 +198,17 @@ class MotionModel:
                 
                 self.optim.zero_grad()
                 self.accelerator.backward(total_loss)
+
+                # Track gradient norm before clipping
+                if opt.log_with_wandb and self.accelerator.is_main_process:
+                    total_norm = 0
+                    for p in self.diffusion.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    grad_norms.append(total_norm)
+                    batch_losses.append(total_loss.detach().cpu().item())
 
                 self.optim.step()
 
@@ -258,6 +274,118 @@ class MotionModel:
                         log_dict['data/num_trials'] = len(train_dataset.trials)
                         log_dict['data/total_frames'] = sum([trial.length for trial in train_dataset.trials])
                         log_dict['data/avg_trial_length'] = sum([trial.length for trial in train_dataset.trials]) / len(train_dataset.trials)
+                        
+                        # Add gradient statistics for monitoring training health
+                        if len(grad_norms) > 0:
+                            log_dict['train/grad_norm_mean'] = np.mean(grad_norms)
+                            log_dict['train/grad_norm_std'] = np.std(grad_norms)
+                            log_dict['train/grad_norm_max'] = np.max(grad_norms)
+                            log_dict['train/grad_norm_min'] = np.min(grad_norms)
+                        
+                        # Add batch loss variance (low variance = mode collapse warning)
+                        if len(batch_losses) > 0:
+                            log_dict['train/batch_loss_mean'] = np.mean(batch_losses)
+                            log_dict['train/batch_loss_std'] = np.std(batch_losses)
+                            log_dict['train/batch_loss_max'] = np.max(batch_losses)
+                            log_dict['train/batch_loss_min'] = np.min(batch_losses)
+                            # CV (coefficient of variation) - normalized variance
+                            if np.mean(batch_losses) > 0:
+                                log_dict['train/batch_loss_cv'] = np.std(batch_losses) / np.mean(batch_losses)
+                        
+                        # Add loss component ratios for debugging
+                        total_loss_sum = avg_loss_simple + avg_loss_vel + avg_loss_fk + avg_loss_drift + avg_loss_slide
+                        if total_loss_sum > 0:
+                            log_dict['loss_ratio/simple'] = avg_loss_simple / total_loss_sum
+                            log_dict['loss_ratio/vel'] = avg_loss_vel / total_loss_sum
+                            log_dict['loss_ratio/fk'] = avg_loss_fk / total_loss_sum
+                            log_dict['loss_ratio/drift'] = avg_loss_drift / total_loss_sum
+                            log_dict['loss_ratio/slide'] = avg_loss_slide / total_loss_sum
+                        
+                        # Model weight statistics (detect dead neurons, exploding weights)
+                        weight_stats = []
+                        for name, param in self.diffusion.model.named_parameters():
+                            if 'weight' in name:
+                                weight_stats.append(param.data.abs().mean().item())
+                        if len(weight_stats) > 0:
+                            log_dict['model/weight_mean'] = np.mean(weight_stats)
+                            log_dict['model/weight_std'] = np.std(weight_stats)
+                            log_dict['model/weight_max'] = np.max(weight_stats)
+                        
+                        # EMA vs model difference (should be small and stable)
+                        ema_diff = 0
+                        n_params = 0
+                        for p1, p2 in zip(self.diffusion.model.parameters(), self.diffusion.master_model.parameters()):
+                            ema_diff += (p1.data - p2.data).abs().mean().item()
+                            n_params += 1
+                        if n_params > 0:
+                            log_dict['model/ema_diff'] = ema_diff / n_params
+                        
+                        # Loss decrease rate (current vs previous epoch)
+                        current_loss = avg_loss_simple / len(train_data_loader)
+                        if epoch > 1 and hasattr(self, 'prev_loss'):
+                            loss_decrease = self.prev_loss - current_loss
+                            loss_decrease_pct = (loss_decrease / self.prev_loss) * 100 if self.prev_loss > 0 else 0
+                            log_dict['train/loss_decrease'] = loss_decrease
+                            log_dict['train/loss_decrease_pct'] = loss_decrease_pct
+                            # Warning signal: loss not decreasing
+                            log_dict['train/is_improving'] = 1 if loss_decrease > 0 else 0
+                        self.prev_loss = current_loss
+                        
+                        # Generate validation sample every N epochs to check output quality
+                        if epoch % 50 == 0 or epoch == opt.epochs:
+                            try:
+                                # Generate a small sample to check if output is collapsing
+                                with torch.no_grad():
+                                    test_shape = (1, self.horizon, self.repr_dim)
+                                    test_sample = self.diffusion.generate_samples(
+                                        test_shape,
+                                        self.normalizer,
+                                        opt,
+                                        mode='generation',
+                                        constraint=None
+                                    )
+                                    
+                                    # Unnormalize to check real values
+                                    test_sample_unnorm = self.normalizer.unnormalize(test_sample)
+                                    
+                                    # Check variance of generated samples (detect mode collapse)
+                                    gen_std = test_sample_unnorm.std(dim=1).mean().item()
+                                    gen_mean = test_sample_unnorm.mean().item()
+                                    gen_max = test_sample_unnorm.max().item()
+                                    gen_min = test_sample_unnorm.min().item()
+                                    
+                                    log_dict['validation/gen_std'] = gen_std
+                                    log_dict['validation/gen_mean'] = gen_mean
+                                    log_dict['validation/gen_range'] = gen_max - gen_min
+                                    
+                                    # Check specific channels (knee, GRF)
+                                    if 'knee_angle_r' in opt.model_states_column_names:
+                                        knee_idx = opt.model_states_column_names.index('knee_angle_r')
+                                        knee_std = test_sample_unnorm[0, :, knee_idx].std().item()
+                                        knee_mean = test_sample_unnorm[0, :, knee_idx].mean().item()
+                                        log_dict['validation/knee_r_std'] = knee_std
+                                        log_dict['validation/knee_r_mean'] = knee_mean
+                                        # Warning: knee std should be > 0.1 rad (~5 degrees)
+                                        log_dict['validation/knee_healthy'] = 1 if knee_std > 0.1 else 0
+                                    
+                                    if 'ground_force_vz_r' in opt.model_states_column_names:
+                                        grf_idx = opt.model_states_column_names.index('ground_force_vz_r')
+                                        grf_std = test_sample_unnorm[0, :, grf_idx].std().item()
+                                        grf_mean = test_sample_unnorm[0, :, grf_idx].mean().item()
+                                        log_dict['validation/grf_vz_r_std'] = grf_std
+                                        log_dict['validation/grf_vz_r_mean'] = grf_mean
+                                        # Warning: GRF std should be > 10 N
+                                        log_dict['validation/grf_healthy'] = 1 if grf_std > 10 else 0
+                                    
+                                    print(f"\n[Validation @ Epoch {epoch}]")
+                                    print(f"  Generated sample std: {gen_std:.4f}")
+                                    if 'knee_angle_r' in opt.model_states_column_names:
+                                        print(f"  Knee_r std: {np.rad2deg(knee_std):.2f}° (healthy > 5°)")
+                                    if 'ground_force_vz_r' in opt.model_states_column_names:
+                                        print(f"  GRF_vz_r std: {grf_std:.2f} N (healthy > 10 N)")
+                                    
+                            except Exception as e:
+                                print(f"  Warning: Validation sample generation failed: {e}")
 
                         wandb.log(log_dict)
 

@@ -1,0 +1,75 @@
+{
+  "num_trials": 11,
+  "avg_mse": 7.523532390594482,
+  "avg_mae": 1.2806513092734597,
+  "avg_rmse": 2.742785172028975,
+  "avg_correlation": NaN,
+  "per_trial": [
+    {
+      "trial": "S011_accel_sine_trial_01",
+      "mse": 7.652889728546143,
+      "mae": 1.3005040884017944,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_asym_30deg_trial_01",
+      "mse": 7.323494911193848,
+      "mae": 1.2342078685760498,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_asym_60deg_trial_01",
+      "mse": 7.39483118057251,
+      "mae": 1.2523082494735718,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_cadence_120p_trial_01",
+      "mse": 7.7272467613220215,
+      "mae": 1.318084716796875,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_cadence_90p_trial_01",
+      "mse": 7.537829399108887,
+      "mae": 1.2880218029022217,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_crouch_trial_01",
+      "mse": 7.4658002853393555,
+      "mae": 1.2822165489196777,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_decline_5deg_trial_01",
+      "mse": 7.52976131439209,
+      "mae": 1.2947181463241577,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_incline_10deg_trial_01",
+      "mse": 7.302618503570557,
+      "mae": 1.242233157157898,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_level_08mps_trial_01",
+      "mse": 7.528175354003906,
+      "mae": 1.2778041362762451,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_level_12mps_trial_01",
+      "mse": 7.5459418296813965,
+      "mae": 1.287938117980957,
+      "correlation": NaN
+    },
+    {
+      "trial": "S011_level_16mps_trial_01",
+      "mse": 7.750267028808594,
+      "mae": 1.3091275691986084,
+      "correlation": NaN
+    }
+  ]
+}

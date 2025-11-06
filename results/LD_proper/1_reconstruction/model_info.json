@@ -1,0 +1,5 @@
+{
+  "checkpoint_path": "runs\\train\\LD_proper\\weights\\train-100_diffusion.pt",
+  "test_trials": 11,
+  "model_params": 5822527
+}

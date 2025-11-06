@@ -30,6 +30,8 @@ def parse_opt():
     parser.add_argument("--batch_size", type=int, default=machine_specific_config['batch_size'], help="batch size")
     parser.add_argument("--batch_size_inference", type=int, default=128, help="batch size during inference")
     parser.add_argument("--pseudo_dataset_len", type=int, default=machine_specific_config['pseudo_dataset_len'], help="pseudo dataset length")
+    parser.add_argument("--learning_rate", type=float, default=4e-4, help="learning rate for optimizer")
+    parser.add_argument("--weight_decay", type=float, default=0.02, help="weight decay for optimizer")
     # parser.add_argument(
     #     "--save_interval",
     #     type=int,

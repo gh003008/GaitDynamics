@@ -190,6 +190,7 @@ class MotionModel:
             for step, x in enumerate(load_loop(train_data_loader)):
                 cond = x[5]
                 total_loss, losses = self.diffusion(x, cond, t_override=None)
+                
                 self.optim.zero_grad()
                 self.accelerator.backward(total_loss)
 
@@ -224,11 +225,14 @@ class MotionModel:
                     }
                     if opt.log_with_wandb:
                         loss_val_name_pairs_terms = [
-                            (avg_loss_simple / len(train_data_loader), 'simple'), (avg_loss_vel / len(train_data_loader), 'vel'),
-                            (avg_loss_fk / len(train_data_loader), 'forward kinematics'), (avg_loss_drift / len(train_data_loader), 'drift'),
-                            (avg_loss_slide / len(train_data_loader), 'slide')]
+                            (avg_loss_simple / len(train_data_loader), 'loss/simple'), 
+                            (avg_loss_vel / len(train_data_loader), 'loss/vel'),
+                            (avg_loss_fk / len(train_data_loader), 'loss/forward_kinematics'), 
+                            (avg_loss_drift / len(train_data_loader), 'loss/drift'),
+                            (avg_loss_slide / len(train_data_loader), 'loss/slide')]
 
-                        loss_val_name_pairs_joints = [(loss_, joint_) for joint_, loss_ in zip(opt.model_states_column_names, joint_loss)]
+                        loss_val_name_pairs_joints = [(loss_, f'joint/{joint_}') 
+                                                       for joint_, loss_ in zip(opt.model_states_column_names, joint_loss)]
 
                         loss_dset = {dset: [0, 0] for dset in train_dataset.dset_set}
                         for dset_name, trial_loss in zip(dset_names, dataset_loss_record):
@@ -238,8 +242,22 @@ class MotionModel:
                         loss_val_name_pairs_dset = []
                         for dset_name, loss_count in loss_dset.items():
                             if loss_count[1] != 0:
-                                loss_val_name_pairs_dset.append((loss_count[0] / loss_count[1], dset_name))
+                                loss_val_name_pairs_dset.append((loss_count[0] / loss_count[1], f'dataset/{dset_name}'))
+                        
+                        # Build log dictionary with organized names
                         log_dict = {name: loss for loss, name in loss_val_name_pairs_dset + loss_val_name_pairs_joints + loss_val_name_pairs_terms}
+                        
+                        # Add training metadata
+                        log_dict['train/epoch'] = epoch
+                        log_dict['train/learning_rate'] = self.optim.param_groups[0]['lr']
+                        log_dict['train/total_loss'] = (avg_loss_simple / len(train_data_loader))  # Only simple loss has weight=1.0
+                        log_dict['train/num_batches'] = len(train_data_loader)
+                        log_dict['train/samples_per_epoch'] = len(train_data_loader) * opt.batch_size
+                        
+                        # Add data statistics
+                        log_dict['data/num_trials'] = len(train_dataset.trials)
+                        log_dict['data/total_frames'] = sum([trial.length for trial in train_dataset.trials])
+                        log_dict['data/avg_trial_length'] = sum([trial.length for trial in train_dataset.trials]) / len(train_dataset.trials)
 
                         wandb.log(log_dict)
 
@@ -734,25 +752,34 @@ class GaussianDiffusion(nn.Module):
         loss_drift = self.loss_fn(model_out[..., :3], target[..., :3], reduction="none")
         loss_drift = loss_drift * extract(self.p2_loss_weight, t, loss_drift.shape)
 
-        osim_states_pred = self.normalizer.unnormalize(model_out)
-        osim_states_pred = inverse_convert_addb_state_to_model_input(
-            osim_states_pred, self.opt.model_states_column_names, self.opt.joints_3d, self.opt.osim_dof_columns,
-            pos_vec=[0, 0, 0], height_m=height_m)
-        _, joint_locations_pred, _, _ = forward_kinematics(osim_states_pred, model_offsets)
-        osim_states_true = self.normalizer.unnormalize(target)
-        osim_states_true = inverse_convert_addb_state_to_model_input(
-            osim_states_true, self.opt.model_states_column_names, self.opt.joints_3d, self.opt.osim_dof_columns,
-            pos_vec=[0, 0, 0], height_m=height_m)
-        foot_locations_pred, joint_locations_true, _, _ = forward_kinematics(osim_states_true, model_offsets)
+        # Skip FK/slide loss calculation if model_offsets are dummy (e.g., for LD dataset)
+        # Check if model_offsets has proper shape (should be [batch, 20, 4, 4] for no-arm model)
+        if model_offsets.shape[1] >= 20 and model_offsets.shape[2] == 4 and model_offsets.shape[3] == 4:
+            # Full FK calculation with proper offsets
+            osim_states_pred = self.normalizer.unnormalize(model_out)
+            osim_states_pred = inverse_convert_addb_state_to_model_input(
+                osim_states_pred, self.opt.model_states_column_names, self.opt.joints_3d, self.opt.osim_dof_columns,
+                pos_vec=[0, 0, 0], height_m=height_m)
+            _, joint_locations_pred, _, _ = forward_kinematics(osim_states_pred, model_offsets)
+            osim_states_true = self.normalizer.unnormalize(target)
+            osim_states_true = inverse_convert_addb_state_to_model_input(
+                osim_states_true, self.opt.model_states_column_names, self.opt.joints_3d, self.opt.osim_dof_columns,
+                pos_vec=[0, 0, 0], height_m=height_m)
+            foot_locations_pred, joint_locations_true, _, _ = forward_kinematics(osim_states_true, model_offsets)
 
-        loss_fk = self.loss_fn(joint_locations_pred, joint_locations_true, reduction="none")
-        loss_fk = loss_fk * extract(self.p2_loss_weight, t, loss_fk.shape[1:])
+            loss_fk = self.loss_fn(joint_locations_pred, joint_locations_true, reduction="none")
+            loss_fk = loss_fk * extract(self.p2_loss_weight, t, loss_fk.shape[1:])
 
-        foot_acc_pred = (foot_locations_pred[..., 2:, :] - 2 * foot_locations_pred[..., 1:-1, :] + foot_locations_pred[..., :-2, :]).abs() * self.opt.target_sampling_rate ** 2
-        stance_based_on_foot_vel = (torch.norm(foot_acc_pred, dim=-1) < 0.3)[..., None].expand(-1, -1, -1, 3)
-        foot_acc_pred[~stance_based_on_foot_vel] = 0
-        loss_slide = self.loss_fn(foot_acc_pred, foot_acc_pred * 0, reduction="none")
-        loss_slide = loss_slide * extract(self.p2_loss_weight, t, loss_slide.shape[1:])
+            foot_acc_pred = (foot_locations_pred[..., 2:, :] - 2 * foot_locations_pred[..., 1:-1, :] + foot_locations_pred[..., :-2, :]).abs() * self.opt.target_sampling_rate ** 2
+            stance_based_on_foot_vel = (torch.norm(foot_acc_pred, dim=-1) < 0.3)[..., None].expand(-1, -1, -1, 3)
+            foot_acc_pred[~stance_based_on_foot_vel] = 0
+            loss_slide = self.loss_fn(foot_acc_pred, foot_acc_pred * 0, reduction="none")
+            loss_slide = loss_slide * extract(self.p2_loss_weight, t, loss_slide.shape[1:])
+        else:
+            # Dummy FK/slide losses for datasets without proper model_offsets
+            # Use zero tensors with same shape as loss_simple for proper .mean() calculation
+            loss_fk = torch.zeros_like(loss_simple)
+            loss_slide = torch.zeros_like(loss_simple)
 
         losses = [
             1. * loss_simple.mean(),

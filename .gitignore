@@ -53,3 +53,5 @@ lab_preprocessing/
 # Local dataset exclusions requested by user (ensure large local folders aren't pushed)
 data/AB/
 data/LD/
+data/LD_gdp/
+data/LD_gdp_test/

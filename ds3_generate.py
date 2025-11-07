@@ -381,9 +381,12 @@ def main():
                 if i == pelvis_tx_idx:
                     continue
                 ref = state_true_norm_local[0, :, i]
-                thd = (ref.max() - ref.min()) * 0.3
-                value_diff_thd_local[i] = float(thd)
-                value_diff_weight_local[i] = 1.0
+                ref_range = ref.max() - ref.min()
+                # For treadmill data (very small ROM), use a minimum threshold
+                # This allows joints to adapt naturally for speed changes
+                thd = max(float(ref_range) * 0.3, 0.5)  # At least 0.5 normalized units
+                value_diff_thd_local[i] = thd
+                value_diff_weight_local[i] = 0.25  # Weak prior for more adaptation freedom
         else:
             if pelvis_tx_idx is not None:
                 value_diff_thd_local[pelvis_tx_idx] = 0.02
